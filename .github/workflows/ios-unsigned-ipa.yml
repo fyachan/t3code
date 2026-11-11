@@ -141,7 +141,9 @@ jobs:
             echo "### Unsigned iOS IPA Built"
             echo "- **File**: \`$(basename "$IPA_FILE")\`"
             echo "- **Variant**: \`${APP_VARIANT}\`"
+            MIN_OS="$(/usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' "$APP_PATH/Info.plist" 2>/dev/null || echo unknown)"
             echo "- **Bundle ID**: \`${BUNDLE_ID}\`"
+            echo "- **MinimumOSVersion**: \`${MIN_OS}\`"
             echo "- **SHA256**: \`$(shasum -a 256 "$IPA_FILE" | awk '{print $1}')\`"
           } >> "$GITHUB_STEP_SUMMARY"
 

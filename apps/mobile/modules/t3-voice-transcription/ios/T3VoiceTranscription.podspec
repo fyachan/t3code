@@ -4,7 +4,7 @@ Pod::Spec.new do |s|
   s.summary = 'Local recording conversion for T3 Code dictation.'
   s.author = 'T3 Tools'
   s.homepage = 'https://t3tools.com'
-  s.platform = :ios, '18.0'
+  s.platform = :ios, '17.0'
   s.source = { :path => '.' }
   s.static_framework = true
   s.dependency 'ExpoModulesCore'

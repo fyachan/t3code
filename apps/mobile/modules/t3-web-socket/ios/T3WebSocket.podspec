@@ -5,7 +5,7 @@ Pod::Spec.new do |s|
   s.description = 'React Native ships SocketRocket on iOS, which never negotiates compression. This module dials the T3 server through URLSessionWebSocketTask, which offers permessage-deflate on its own.'
   s.author = 'T3 Tools'
   s.homepage = 'https://t3tools.com'
-  s.platform = :ios, '18.0'
+  s.platform = :ios, '17.0'
   s.source = { :path => '.' }
   s.static_framework = true
   s.dependency 'ExpoModulesCore'

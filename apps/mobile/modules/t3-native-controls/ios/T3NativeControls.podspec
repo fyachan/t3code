@@ -6,7 +6,7 @@ Pod::Spec.new do |s|
   s.author         = 'T3 Tools'
   s.homepage       = 'https://t3tools.com'
   s.platforms      = {
-    :ios => '18.0',
+    :ios => '17.0',
   }
   s.source         = { :path => '.' }
   s.static_framework = true
