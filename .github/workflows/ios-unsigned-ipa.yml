@@ -1,0 +1,155 @@
+name: Build Unsigned iOS IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      app_variant:
+        description: App variant to build
+        required: true
+        default: production
+        type: choice
+        options:
+          - production
+          - preview
+          - development
+      bundle_id:
+        description: iOS Bundle Identifier (Personal Team / Sideloading)
+        required: true
+        default: com.fyachan.t3code
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-unsigned-ipa-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-ipa:
+    name: Build Unsigned IPA (${{ inputs.app_variant || 'production' }})
+    runs-on: macos-26
+    timeout-minutes: 60
+    env:
+      NODE_OPTIONS: --max-old-space-size=8192
+      APP_VARIANT: ${{ inputs.app_variant || 'production' }}
+      BUNDLE_ID: ${{ inputs.bundle_id || 'com.fyachan.t3code' }}
+      T3CODE_IOS_PERSONAL_TEAM: "1"
+      T3CODE_IOS_PERSONAL_TEAM_BUNDLE_ID: ${{ inputs.bundle_id || 'com.fyachan.t3code' }}
+      T3CODE_MOBILE_UPDATES_ENABLED: "0"
+      MOBILE_VERSION_POLICY: appVersion
+      EXPO_NO_GIT_STATUS: "1"
+      EXPO_NO_TELEMETRY: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          sparse-checkout: |
+            /*
+            !/.repos/
+          sparse-checkout-cone-mode: false
+
+      - name: Setup Vite+ and workspace dependencies
+        uses: voidzero-dev/setup-vp@v1
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: |
+            args:
+              - --filter=.
+              - --filter=@t3tools/mobile...
+              - --filter=@t3tools/scripts...
+
+      - name: Expose pnpm and verify toolchain
+        run: |
+          pnpm_version="$(node --print "require('./package.json').packageManager.split('@').pop()")"
+          vp_pnpm_bin="$HOME/.vite-plus/package_manager/pnpm/$pnpm_version/pnpm/bin"
+          echo "$vp_pnpm_bin" >> "$GITHUB_PATH"
+          "$vp_pnpm_bin/pnpm" --version
+          node --version
+          xcodebuild -version
+          pod --version
+
+      - name: Cache CocoaPods
+        uses: actions/cache@v6
+        with:
+          path: ~/Library/Caches/CocoaPods
+          key: cocoapods-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('apps/mobile/package.json', 'pnpm-lock.yaml') }}
+          restore-keys: |
+            cocoapods-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Expo Prebuild and Pod Install
+        working-directory: apps/mobile
+        run: |
+          pnpm exec expo prebuild --clean --platform ios --no-install
+          {
+            echo "export NODE_BINARY=\"$(command -v node)\""
+            echo "export PATH=\"$(dirname "$(command -v node)"):$PATH\""
+            echo "export NODE_OPTIONS=\"--max-old-space-size=8192\""
+            echo "export APP_VARIANT=\"${APP_VARIANT}\""
+            echo "export T3CODE_IOS_PERSONAL_TEAM=\"1\""
+            echo "export T3CODE_IOS_PERSONAL_TEAM_BUNDLE_ID=\"${BUNDLE_ID}\""
+            echo "export T3CODE_MOBILE_UPDATES_ENABLED=\"0\""
+            echo "export MOBILE_VERSION_POLICY=\"appVersion\""
+            echo "export EXPO_NO_GIT_STATUS=\"1\""
+          } > ios/.xcode.env.local
+          cat ios/.xcode.env.local
+          cd ios
+          pod install
+
+      - name: Build Unsigned Release App
+        working-directory: apps/mobile
+        run: |
+          WORKSPACE_PATH="$(ls -d ios/*.xcworkspace | head -n 1)"
+          SCHEME_NAME="$(basename "$WORKSPACE_PATH" .xcworkspace)"
+          DERIVED_DATA="$RUNNER_TEMP/DerivedData"
+          echo "Building workspace=$WORKSPACE_PATH scheme=$SCHEME_NAME"
+
+          xcrun xcodebuild \
+            -workspace "$WORKSPACE_PATH" \
+            -scheme "$SCHEME_NAME" \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination "generic/platform=iOS" \
+            -derivedDataPath "$DERIVED_DATA" \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            DEVELOPMENT_TEAM="" \
+            ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=NO \
+            COMPILER_INDEX_STORE_ENABLE=NO \
+            build
+
+      - name: Package Unsigned IPA
+        run: |
+          APP_PATH="$(ls -d "$RUNNER_TEMP/DerivedData/Build/Products/Release-iphoneos/"*.app | head -n 1)"
+          if [ -z "$APP_PATH" ] || [ ! -d "$APP_PATH" ]; then
+            echo "::error::No .app bundle found in Release-iphoneos"
+            ls -la "$RUNNER_TEMP/DerivedData/Build/Products/" || true
+            exit 1
+          fi
+          STAGE_DIR="$RUNNER_TEMP/ipa-stage"
+          OUT_DIR="$RUNNER_TEMP/ipa-out"
+          mkdir -p "$STAGE_DIR/Payload" "$OUT_DIR"
+          ditto "$APP_PATH" "$STAGE_DIR/Payload/$(basename "$APP_PATH")"
+          IPA_FILE="$OUT_DIR/T3Code-${APP_VARIANT}-unsigned.ipa"
+          (cd "$STAGE_DIR" && zip -qry9 "$IPA_FILE" Payload)
+          ls -lh "$IPA_FILE"
+          shasum -a 256 "$IPA_FILE"
+          {
+            echo "### Unsigned iOS IPA Built"
+            echo "- **File**: \`$(basename "$IPA_FILE")\`"
+            echo "- **Variant**: \`${APP_VARIANT}\`"
+            echo "- **Bundle ID**: \`${BUNDLE_ID}\`"
+            echo "- **SHA256**: \`$(shasum -a 256 "$IPA_FILE" | awk '{print $1}')\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload IPA Artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: T3Code-${{ inputs.app_variant || 'production' }}-unsigned-ipa
+          path: ${{ runner.temp }}/ipa-out/*.ipa
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
