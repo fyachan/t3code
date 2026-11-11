@@ -13,12 +13,18 @@ import * as Path from "effect/Path";
 import * as Exit from "effect/Exit";
 import * as Semaphore from "effect/Semaphore";
 import * as Scope from "effect/Scope";
+import * as Stream from "effect/Stream";
 import * as EffectAcpErrors from "effect-acp/errors";
 
+import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as ProviderHost from "@t3tools/provider-core/server/ProviderHost";
 import { PULL_REQUEST_LINKING_INSTRUCTIONS } from "@t3tools/provider-core/server/runtimeInstructions";
 import type { AntigravityAuth } from "../../provider/AntigravityAuth.ts";
 import type * as AcpSessionRuntime from "@t3tools/provider-acp/server/AcpSessionRuntime";
+import {
+  CurrentAntigravityBackgroundWake,
+  makeAntigravityBackgroundWake,
+} from "../../provider/acp/AntigravityBackgroundWake.ts";
 import {
   antigravityAppendsSystemPrompt,
   antigravityPermissionMode,
@@ -91,6 +97,8 @@ export interface AntigravityAdapterV2Options {
   readonly continuationRequests?: Parameters<typeof makeAcpAdapterV2>[0]["continuationRequests"];
   /** The agent's GEMINI_HOME. Its session logs show turns that ended on an upstream error. */
   readonly profileDirectory?: string;
+  /** The OS user home whose `.gemini/antigravity-cli` holds native CLI session state. */
+  readonly userHome?: string;
 }
 
 /**
@@ -138,6 +146,7 @@ export function makeAntigravityAcpAdapterFlavor(
     cwd === null ? [options.host.paths.attachmentsDir] : [cwd, options.host.paths.attachmentsDir];
   const makeRuntime = Effect.fn("AntigravityAdapterV2.makeRuntime")(
     function* (input: AcpAdapterV2RuntimeInput) {
+      const backgroundWake = yield* CurrentAntigravityBackgroundWake;
       const scope = yield* Scope.fork(yield* Effect.scope);
       const runtime = yield* options
         .withProcess(
@@ -179,21 +188,72 @@ export function makeAntigravityAcpAdapterFlavor(
             ),
           ),
         prompt: (payload, promptOptions) =>
-          Effect.sync(reads.reset).pipe(Effect.andThen(runtime.prompt(payload, promptOptions))),
+          Effect.sync(() => {
+            reads.reset();
+            backgroundWake?.onPromptStarted();
+          }).pipe(
+            Effect.andThen(runtime.prompt(payload, promptOptions)),
+            Effect.ensuring(
+              Effect.sync(() => {
+                backgroundWake?.onPromptEnded();
+              }),
+            ),
+          ),
         handleSessionUpdate: (handler) => {
           projectUpdate = handler;
           return runtime.handleSessionUpdate((notification) =>
-            updates.withPermit(handler(reads.repair(notification))),
+            updates.withPermit(
+              Effect.gen(function* () {
+                const repaired = reads.repair(notification);
+                if (backgroundWake !== undefined) {
+                  yield* backgroundWake.observeSessionUpdate(repaired);
+                }
+                yield* handler(repaired);
+              }),
+            ),
           );
         },
         start: () =>
-          runtime
-            .start()
-            .pipe(
-              Effect.tap(
-                (started) => options.onSessionStarted?.(started, input.cwd) ?? Effect.void,
-              ),
+          runtime.start().pipe(
+            Effect.tap((started) =>
+              (backgroundWake === undefined
+                ? Effect.void
+                : backgroundWake.activateSession(started.sessionId, {
+                    seedExistingMessages: input.resumeSessionId !== undefined,
+                  })
+              ).pipe(Effect.andThen(options.onSessionStarted?.(started, input.cwd) ?? Effect.void)),
             ),
+          ),
+        loadSession: (sessionId, activationOptions) =>
+          runtime.loadSession(sessionId, activationOptions).pipe(
+            Effect.tap((started) =>
+              backgroundWake === undefined
+                ? Effect.void
+                : backgroundWake.activateSession(started.sessionId, {
+                    seedExistingMessages: true,
+                  }),
+            ),
+          ),
+        resumeSession: (sessionId, activationOptions) =>
+          runtime.resumeSession(sessionId, activationOptions).pipe(
+            Effect.tap((started) =>
+              backgroundWake === undefined
+                ? Effect.void
+                : backgroundWake.activateSession(started.sessionId, {
+                    seedExistingMessages: true,
+                  }),
+            ),
+          ),
+        forkSession: (sessionId, activationOptions, meta) =>
+          runtime.forkSession(sessionId, activationOptions, meta).pipe(
+            Effect.tap((started) =>
+              backgroundWake === undefined
+                ? Effect.void
+                : backgroundWake.activateSession(started.sessionId, {
+                    seedExistingMessages: true,
+                  }),
+            ),
+          ),
       } satisfies typeof runtime;
     },
     Effect.provideService(SecureRandom.SecureRandom, options.random),
@@ -296,7 +356,7 @@ export const makeAntigravityAdapterV2 = Effect.fn("makeAntigravityAdapterV2")(fu
     path: yield* Path.Path,
     host: yield* ProviderHost.ProviderHost,
   };
-  return yield* makeAcpAdapterV2({
+  const baseAdapter = yield* makeAcpAdapterV2({
     instanceId: options.instanceId,
     flavor: makeAntigravityAcpAdapterFlavor({ ...options, ...services }),
     selfInvocation: options.selfInvocation,
@@ -304,5 +364,95 @@ export const makeAntigravityAdapterV2 = Effect.fn("makeAntigravityAdapterV2")(fu
     ...(options.continuationRequests === undefined
       ? {}
       : { continuationRequests: options.continuationRequests }),
+  });
+  return ProviderAdapter.ProviderAdapterV2.of({
+    ...baseAdapter,
+    openSession: Effect.fn("AntigravityAdapterV2.openSession")(function* (input) {
+      const wake = yield* makeAntigravityBackgroundWake({
+        ...(options.profileDirectory === undefined
+          ? {}
+          : { profileDirectory: options.profileDirectory }),
+        ...(options.userHome === undefined ? {} : { userHome: options.userHome }),
+        ...(options.continuationRequests === undefined
+          ? {}
+          : { continuationRequests: options.continuationRequests }),
+      });
+      const withWake = Effect.provideService(CurrentAntigravityBackgroundWake, wake);
+      const baseSession = yield* baseAdapter.openSession(input).pipe(withWake);
+      const baseHasPendingBackgroundWork = baseSession.hasPendingBackgroundWork;
+      return {
+        ...baseSession,
+        events: baseSession.events.pipe(
+          Stream.tap((event) =>
+            event.type === "turn.terminal" ? wake.onTurnTerminal(event.status) : Effect.void,
+          ),
+        ),
+        hasPendingBackgroundWork:
+          baseHasPendingBackgroundWork === undefined
+            ? wake.hasPendingBackgroundWork
+            : Effect.gen(function* () {
+                return (
+                  (yield* baseHasPendingBackgroundWork) || (yield* wake.hasPendingBackgroundWork)
+                );
+              }),
+        ensureThread: (threadInput) =>
+          baseSession.ensureThread(threadInput).pipe(
+            withWake,
+            Effect.tap((providerThread) => {
+              const nativeId = providerThread.nativeThreadRef?.nativeId;
+              return nativeId == null
+                ? Effect.void
+                : wake.activateSession(nativeId, { seedExistingMessages: false });
+            }),
+          ),
+        resumeThread: (threadInput) =>
+          baseSession.resumeThread(threadInput).pipe(
+            withWake,
+            Effect.tap((providerThread) => {
+              const nativeId = providerThread.nativeThreadRef?.nativeId;
+              return nativeId == null
+                ? Effect.void
+                : wake.activateSession(nativeId, { seedExistingMessages: true });
+            }),
+          ),
+        startTurn: (turnInput) =>
+          wake
+            .onTurnStarting({
+              threadId: turnInput.threadId,
+              providerThreadId: turnInput.providerThread.id,
+              nativeSessionId: turnInput.providerThread.nativeThreadRef?.nativeId ?? null,
+            })
+            .pipe(
+              Effect.andThen(
+                baseSession.startTurn(turnInput).pipe(
+                  withWake,
+                  Effect.tapError(() => wake.onTurnStartFailed()),
+                ),
+              ),
+            ),
+        interruptTurn: (turnInput) =>
+          wake
+            .onInterrupt()
+            .pipe(Effect.andThen(baseSession.interruptTurn(turnInput).pipe(withWake))),
+        readThreadSnapshot: (snapshotInput) =>
+          baseSession.readThreadSnapshot(snapshotInput).pipe(withWake),
+        rollbackThread: (rollbackInput) =>
+          baseSession.rollbackThread(rollbackInput).pipe(
+            withWake,
+            Effect.tap((rolledBack) =>
+              wake.resetForReplacementSession(
+                rolledBack.providerThread.nativeThreadRef?.nativeId ?? null,
+              ),
+            ),
+          ),
+        forkThread: (forkInput) =>
+          baseSession.forkThread(forkInput).pipe(
+            withWake,
+            Effect.tap((forked) =>
+              wake.resetForReplacementSession(forked.nativeThreadRef?.nativeId ?? null),
+            ),
+          ),
+      };
+    }),
   });
 });

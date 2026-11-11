@@ -463,6 +463,7 @@ export const AntigravityDriver: ProviderDriver<
       withProcess: authFlow.withProcess,
       defaultModel,
       profileDirectory,
+      userHome,
       onSessionStarted: provider.onSessionStarted,
       onSessionEvent: (event) => {
         if (event._tag === "ConfigOptionsUpdated") {

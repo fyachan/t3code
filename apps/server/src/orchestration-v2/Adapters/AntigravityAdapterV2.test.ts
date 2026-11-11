@@ -21,12 +21,15 @@ import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Path from "effect/Path";
+import * as Queue from "effect/Queue";
 import * as Stream from "effect/Stream";
 import { ChildProcessSpawner } from "effect/process";
 import type * as EffectAcpSchema from "effect-acp/compat";
 import * as EffectAcpErrors from "effect-acp/errors";
 
+import * as ProviderContinuationRequests from "@t3tools/provider-core/server/ProviderContinuationRequests";
 import * as ProviderHost from "@t3tools/provider-core/server/ProviderHost";
 import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
 import * as TestProviderHost from "@t3tools/provider-testing/TestProviderHost";
@@ -1240,6 +1243,245 @@ describe("AntigravityAdapterV2 session system prompt", () => {
           assert.notInclude(append, "systemPrompt");
           assert.include(sent, "<pull_request_linking>");
         }
+      }).pipe(Effect.provide(layerSession), Effect.scoped),
+  );
+});
+
+describe("AntigravityAdapterV2 background wakeups", () => {
+  it.effect(
+    "pins background commands across turn completion and offers a message_text continuation when unread high-priority messages arrive",
+    () =>
+      Effect.gen(function* () {
+        const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+        const fileSystem = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const crypto = yield* SecureRandom.SecureRandom;
+        const mockAgentPath = yield* path.fromFileUrl(
+          new URL("../../../scripts/acp-mock-agent.ts", import.meta.url),
+        );
+        const profileDirectory = yield* fileSystem.makeTempDirectoryScoped({
+          prefix: "t3-antigravity-profile-",
+        });
+        const workspace = yield* fileSystem.makeTempDirectoryScoped({
+          prefix: "t3-antigravity-bg-ws-",
+        });
+        const offered =
+          yield* Queue.unbounded<ProviderContinuationRequests.ProviderContinuationRequest>();
+        type RuntimeService = AcpSessionRuntime.AcpSessionRuntime["Service"];
+        let sessionUpdate: Parameters<RuntimeService["handleSessionUpdate"]>[0] | undefined;
+        const prompts: Array<Parameters<RuntimeService["prompt"]>[0]> = [];
+        let turnNumber = 0;
+
+        const instanceId = ProviderInstanceId.make("antigravity-bg-wake-test");
+        const threadId = ThreadId.make("thread-antigravity-bg-wake");
+        const adapter = yield* makeAntigravityAdapterV2({
+          instanceId,
+          selfInvocation: yield* resolveSelfInvocation(),
+          profileDirectory,
+          continuationRequests: {
+            offer: (request) => Queue.offer(offered, request).pipe(Effect.asVoid),
+          },
+          makeRuntime: (input) =>
+            makeAntigravityAcpRuntime({
+              ...input,
+              childProcessSpawner,
+              spawn: {
+                command: process.execPath,
+                args: [mockAgentPath],
+                cwd: input.cwd,
+                env: { T3_ACP_ANTIGRAVITY: "1" },
+              },
+            }).pipe(
+              Effect.provideService(SecureRandom.SecureRandom, crypto),
+              Effect.map((runtime): RuntimeService => ({
+                ...runtime,
+                handleSessionUpdate: (handler) =>
+                  Effect.sync(() => {
+                    sessionUpdate = handler;
+                  }).pipe(Effect.andThen(runtime.handleSessionUpdate(handler))),
+                prompt: (request) =>
+                  Effect.gen(function* () {
+                    prompts.push(request);
+                    turnNumber += 1;
+                    if (sessionUpdate === undefined) {
+                      return yield* Effect.die("the adapter must handle session updates");
+                    }
+                    if (turnNumber === 1) {
+                      yield* sessionUpdate(
+                        normalizeAntigravitySessionUpdate({
+                          sessionId: "mock-session-1",
+                          update: {
+                            sessionUpdate: "tool_call",
+                            toolCallId: "call_bg_clone",
+                            title: "run_command",
+                            kind: "execute",
+                            status: "in_progress",
+                            rawInput: {
+                              CommandLine: "git clone https://github.com/pingdotgg/t3code.git",
+                              WaitMsBeforeAsync: 10000,
+                              toolSummary: "Clone t3code repository",
+                            },
+                          },
+                        }),
+                      );
+                    }
+                    return { stopReason: "end_turn" as const };
+                  }),
+              })),
+            ),
+          withProcess: (_stop, task) => task,
+          defaultModel: Effect.undefined,
+        });
+
+        const runtimePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          cwd: workspace,
+        });
+        const modelSelection = { instanceId, model: "gemini-test-low" } as const;
+        const session = yield* adapter.openSession({
+          threadId,
+          providerSessionId: ProviderSessionId.make("provider-session-antigravity-bg-wake"),
+          modelSelection,
+          runtimePolicy,
+        });
+        const providerThread = yield* session.ensureThread({
+          threadId,
+          modelSelection,
+          runtimePolicy,
+        });
+        const now = yield* DateTime.now;
+        const appThread = {
+          createdBy: "user" as const,
+          creationSource: "web" as const,
+          id: threadId,
+          projectId: ProjectId.make("project-antigravity-bg-wake"),
+          title: "Antigravity background wake",
+          providerInstanceId: instanceId,
+          modelSelection,
+          runtimeMode: "full-access" as const,
+          interactionMode: "default" as const,
+          branch: null,
+          worktreePath: workspace,
+          activeProviderThreadId: providerThread.id,
+          lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
+          forkedFrom: null,
+          createdAt: now,
+          updatedAt: now,
+          archivedAt: null,
+          settledOverride: null,
+          settledAt: null,
+          lastVisitedAt: null,
+          deletedAt: null,
+        };
+
+        yield* session.startTurn({
+          appThread,
+          threadId,
+          runId: RunId.make("run-antigravity-bg-wake-1"),
+          runOrdinal: 1,
+          providerTurnOrdinal: 1,
+          attemptId: RunAttemptId.make("attempt-antigravity-bg-wake-1"),
+          rootNodeId: NodeId.make("node-antigravity-bg-wake-1"),
+          providerThread,
+          message: {
+            createdBy: "user",
+            creationSource: "web",
+            messageId: MessageId.make("message-antigravity-bg-wake-1"),
+            text: "clone t3code",
+            attachments: [],
+          },
+          modelSelection,
+          runtimePolicy,
+        });
+        yield* session.events.pipe(
+          Stream.takeUntil((event) => event.type === "turn.terminal"),
+          Stream.runDrain,
+        );
+
+        if (session.hasPendingBackgroundWork === undefined) {
+          return yield* Effect.die("expected session.hasPendingBackgroundWork to be defined");
+        }
+        assert.isTrue(yield* session.hasPendingBackgroundWork);
+
+        const messagesDir = path.join(
+          profileDirectory,
+          "antigravity-acp",
+          "brain",
+          "mock-session-1",
+          ".system_generated",
+          "messages",
+        );
+        yield* fileSystem.makeDirectory(messagesDir, { recursive: true });
+        yield* fileSystem.writeFileString(
+          path.join(messagesDir, "msg-clone-done.json"),
+          JSON.stringify({
+            id: "msg-clone-done",
+            recipient: "mock-session-1",
+            sender: "mock-session-1/task-6",
+            priority: "MESSAGE_PRIORITY_HIGH",
+            renderDetails: { messageTitle: "Clone t3code repository finished" },
+            content:
+              'Task id "mock-session-1/task-6" finished with result:\nCommand exited with code 0.\n\nCommand output:\nDone\n',
+            sourceMetadata: {
+              tool: {
+                toolCall: {
+                  id: "call_bg_clone",
+                  name: "run_command",
+                  argumentsJson: JSON.stringify({
+                    CommandLine: "git clone https://github.com/pingdotgg/t3code.git",
+                    WaitMsBeforeAsync: 10000,
+                    toolSummary: "Clone t3code repository",
+                  }),
+                },
+              },
+            },
+          }),
+        );
+
+        const request = yield* Queue.take(offered);
+        assert.equal(request.driver, "antigravity");
+        assert.equal(request.threadId, threadId);
+        assert.equal(request.providerThreadId, providerThread.id);
+        assert.equal(request.delivery, "message_text");
+        assert.deepEqual(request.notification, {
+          source: { kind: "command" },
+          outcome: "completed",
+          summary: 'Command "Clone t3code repository" finished (exit 0)',
+        });
+
+        const dispatched =
+          request.dispatchIfCurrent === undefined
+            ? Option.some(true)
+            : yield* request.dispatchIfCurrent(Effect.succeed(true));
+        assert.isTrue(Option.isSome(dispatched));
+
+        yield* session.startTurn({
+          appThread,
+          threadId,
+          runId: RunId.make("run-antigravity-bg-wake-2"),
+          runOrdinal: 2,
+          providerTurnOrdinal: 2,
+          attemptId: RunAttemptId.make("attempt-antigravity-bg-wake-2"),
+          rootNodeId: NodeId.make("node-antigravity-bg-wake-2"),
+          providerThread,
+          message: {
+            createdBy: "agent",
+            creationSource: "server",
+            messageId: MessageId.make("message-antigravity-bg-wake-2"),
+            text: request.detail ?? "Background task completed.",
+            attachments: [],
+          },
+          modelSelection,
+          runtimePolicy,
+        });
+        yield* session.events.pipe(
+          Stream.takeUntil((event) => event.type === "turn.terminal"),
+          Stream.runDrain,
+        );
+
+        assert.lengthOf(prompts, 2);
+        assert.isFalse(yield* session.hasPendingBackgroundWork);
       }).pipe(Effect.provide(layerSession), Effect.scoped),
   );
 });
